@@ -1,34 +1,69 @@
-# Python environments & cache
+# === Python ===
 __pycache__/
 *.py[cod]
 *$py.class
-.ipynb_checkpoints/
-venv/
-.venv/
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# === Environments & Virtual Envs ===
+.env
+.venv
 env/
-main_env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+pip-log.txt
+pip-delete-this-directory.txt
 
-# Raw Data (MIT-BIH AFDB)
-# Mengabaikan file sinyal berat dan anotasi agar tidak membebani repository
-files/*.dat
-files/*.hea
-files/*.hea-*
-files/*.atr
-files/*.atr-*
-files/*.qrs
-files/*.qrs-*
-files/*.qrsc
-files/*.xws
-# (Opsional) Jika Anda ingin mengabaikan seluruh folder files, aktifkan baris di bawah:
-# files/
+# === Jupyter Notebook ===
+.ipynb_checkpoints
+*/.ipynb_checkpoints
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
 
-# (Opsional) Mengabaikan dataset yang digenerate jika ukurannya terlalu besar
-# hrv_features_dataset.csv
-
-# VS Code / IDE
+# === IDEs / Editors ===
 .vscode/
 .idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+*~
 
-# OS generated files
+# === Operating System Files ===
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
+
+# === Machine Learning & Data Files (Optional/Custom) ===
+# Uncomment the lines below if you do NOT want to push datasets or model outputs to GitHub
+dataset_hrv.csv
+raw_71.json
+files/
+# model_export/
+*.csv
+*.json
+
