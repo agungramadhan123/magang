@@ -1,505 +1,258 @@
 """
-=============================================================================
-EKSTRAKSI FITUR HRV (Heart Rate Variability) DARI DATABASE AFDB
-=============================================================================
-
-Tujuan  : Mengubah data rekaman EKG mentah menjadi dataset CSV yang bersih
-          dan siap dipakai oleh model Machine Learning / Deep Learning.
-
-Alur    :
-  1. Baca file .hea   → konfirmasi sampling rate = 250 Hz
-  2. Baca file .qrsc/.qrs → ambil lokasi tiap detak jantung (QRS)
-  3. Hitung IBI (Inter-Beat Interval) = jarak waktu antar-detak (ms)
-  4. Potong IBI menjadi jendela 10 detik
-  5. Hitung 10 fitur HRV di setiap jendela
-  6. Baca file .atr    → tentukan label kelas ritme di jendela itu
-  7. Simpan hasilnya ke file CSV
-
-Kelas   :
-  0 = Normal (N)
-  1 = Atrial Fibrillation (AFIB)
-  2 = Atrial Flutter (AFL)
-  Selain itu → jendela diabaikan
-
-Output  : dataset_hrv.csv
-=============================================================================
+AFDB Extraction Pipeline (23 Pasien Bersih - Clinical Gold Standard)
 """
 
 import os
+import sys
+import logging
 import numpy as np
+import pandas as pd
 import wfdb
-import csv
 
-FOLDER       = "./files"           # Lokasi file-file rekaman
-RECORDS_FILE = "RECORDS"           # File daftar nama rekaman
-FS           = 250                 # Sampling rate yang diharapkan (Hz)
-WINDOW_SEC   = 10                  # Durasi jendela dalam detik
-OUTPUT_FILE  = "dataset_hrv.csv"   # Nama file output
-
-# Pemetaan label ritme ke angka kelas
-LABEL_MAP = {
-    "(N":    0,   # Normal
-    "(AFIB": 1,   # Atrial Fibrillation
-    "(AFL":  2,   # Atrial Flutter
-}
-
-
-# ─────────────────────────────────────────────────────────────
-# FUNGSI-FUNGSI PEMBANTU
-# ─────────────────────────────────────────────────────────────
-
-def baca_daftar_rekaman(folder):
-    """
-    Membaca file RECORDS untuk mendapatkan daftar nama rekaman.
-
-    PENJELASAN:
-    File RECORDS berisi satu nama rekaman per baris, misalnya:
-        04015
-        04043
-        ...
-    Fungsi ini membaca file tersebut dan mengembalikan list berisi
-    nama-nama rekaman tanpa spasi/newline.
-    """
-    path = os.path.join(folder, RECORDS_FILE)
-    with open(path, "r") as f:
-        return [baris.strip() for baris in f if baris.strip()]
-
-
-def konfirmasi_sampling_rate(folder, nama_rekaman):
-    """
-    Membaca file .hea dan memastikan sampling rate = 250 Hz.
-
-    PENJELASAN:
-    File .hea (header) menyimpan metadata rekaman, termasuk:
-    - Jumlah sinyal (2 lead ECG)
-    - Sampling rate (fs)
-    - Panjang sinyal dalam sampel
-
-    Contoh baris pertama file 04015.hea:
-        04015 2 250 9205760  9:00:00
-              │ │   │        └── waktu mulai
-              │ │   └── panjang sinyal (sampel)
-              │ └── sampling rate
-              └── jumlah sinyal
-
-    Kita mengecek apakah fs == 250. Jika tidak, rekaman dilewati.
-    """
-    header = wfdb.rdheader(os.path.join(folder, nama_rekaman))
-    return header.fs == FS
-
-
-def baca_lokasi_detak(folder, nama_rekaman):
-    """
-    Membaca file .qrsc atau .qrs untuk mendapatkan lokasi (indeks sampel)
-    setiap detak jantung.
-
-    PENJELASAN:
-    File .qrs berisi hasil deteksi otomatis posisi QRS complex
-    (puncak detak jantung). File .qrsc adalah versi yang sudah
-    dikoreksi oleh ahli (lebih akurat).
-
-    Fungsi ini mengembalikan array berisi indeks sampel, misalnya:
-        [61, 246, 432, 614, 798, ...]
-    Artinya detak pertama terjadi di sampel ke-61, kedua di 246, dst.
-
-    Prioritas: .qrsc (koreksi) > .qrs (otomatis)
-    """
-    path = os.path.join(folder, nama_rekaman)
-
-    # Coba baca .qrsc dulu (versi terkoreksi, lebih akurat)
-    if os.path.exists(path + ".qrsc"):
-        ann = wfdb.rdann(path, "qrsc")
-    else:
-        ann = wfdb.rdann(path, "qrs")
-
-    return ann.sample
-
-
-def hitung_ibi(lokasi_detak, fs):
-    """
-    Menghitung IBI (Inter-Beat Interval) dalam milidetik.
-
-    PENJELASAN:
-    IBI = jarak waktu antara satu detak jantung ke detak berikutnya.
-
-    Cara hitung:
-    1. Ambil selisih antara lokasi detak berturut-turut (dalam sampel)
-       Contoh: lokasi = [61, 246, 432]
-               selisih = [185, 186]  (dalam satuan sampel)
-
-    2. Konversi ke milidetik:
-       IBI (ms) = selisih_sampel / fs * 1000
-       Contoh: 185 / 250 * 1000 = 740 ms
-
-    3. Simpan juga waktu kapan IBI itu terjadi (pakai titik tengah
-       antara dua detak sebagai acuan waktu).
-
-    Return:
-      waktu_ibi : array waktu terjadinya IBI (dalam detik)
-      nilai_ibi : array nilai IBI (dalam milidetik)
-    """
-    # Selisih antar-detak berturut-turut (dalam satuan sampel)
-    selisih_sampel = np.diff(lokasi_detak)
-
-    # Konversi ke milidetik
-    nilai_ibi = selisih_sampel / fs * 1000.0
-
-    # Waktu terjadinya setiap IBI (dalam detik), pakai titik detak kedua
-    # dari pasangan sebagai acuan waktu
-    waktu_ibi = lokasi_detak[1:] / fs
-
-    return waktu_ibi, nilai_ibi
-
-
-def baca_label_ritme(folder, nama_rekaman):
-    """
-    Membaca file .atr untuk mendapatkan anotasi ritme jantung.
-
-    PENJELASAN:
-    File .atr berisi penanda pergantian ritme jantung.
-    Setiap entri memiliki:
-      - sample  : di titik sampel ke-berapa ritme berubah
-      - symbol  : selalu '+' (penanda ritme)
-      - aux_note: nama ritme, misal '(N', '(AFIB', '(AFL'
-
-    Contoh isi .atr untuk rekaman 04015:
-      Sampel      Label
-      30          (N        → Dari sini, ritme = Normal
-      102584      (AFIB     → Dari sini, ritme = Atrial Fibrillation
-      119604      (N        → Dari sini, ritme kembali Normal
-      ...
-
-    Fungsi ini mengembalikan dua array:
-      - posisi_perubahan: kapan ritme berubah (dalam sampel)
-      - label_ritme     : ritme apa yang dimulai di titik itu
-    """
-    path = os.path.join(folder, nama_rekaman)
-    ann = wfdb.rdann(path, "atr")
-
-    posisi_perubahan = ann.sample
-    label_ritme = ann.aux_note
-
-    return posisi_perubahan, label_ritme
-
-
-def tentukan_label_jendela(awal_detik, akhir_detik, posisi_perubahan, label_ritme, fs):
-    """
-    Menentukan label kelas untuk satu jendela waktu tertentu.
-
-    PENJELASAN:
-    Satu jendela (misal detik 10-20) bisa tumpang tindih dengan
-    beberapa zona ritme yang berbeda. Kita perlu mencari tahu
-    ritme mana yang DOMINAN (paling lama durasinya) di jendela itu.
-
-    Caranya:
-    1. Konversi batas jendela ke satuan sampel
-    2. Untuk setiap zona ritme yang overlap dengan jendela,
-       hitung berapa lama (sampel) zona itu ada di dalam jendela
-    3. Pilih ritme dengan durasi terbanyak → itu label kelasnya
-
-    Contoh:
-      Jendela detik 10-20 (sampel 2500-5000)
-      Zona ritme:  (N    dari sampel 0 - 3000
-                   (AFIB dari sampel 3000 - 8000
-
-      Durasi (N    di jendela = 3000 - 2500 = 500 sampel
-      Durasi (AFIB di jendela = 5000 - 3000 = 2000 sampel
-      → Dominan = (AFIB → Label = 1
-
-    Return:
-      Angka kelas (0, 1, atau 2), atau None jika label tidak dikenali
-    """
-    awal_sampel = int(awal_detik * fs)
-    akhir_sampel = int(akhir_detik * fs)
-
-    # Hitung durasi setiap ritme di dalam jendela ini
-    durasi_per_label = {}
-
-    for i in range(len(posisi_perubahan)):
-        label = label_ritme[i]
-
-        # Awal zona = posisi perubahan ritme ini
-        zona_awal = posisi_perubahan[i]
-
-        # Akhir zona = posisi perubahan berikutnya, atau tak terhingga
-        if i + 1 < len(posisi_perubahan):
-            zona_akhir = posisi_perubahan[i + 1]
-        else:
-            zona_akhir = float("inf")
-
-        # Hitung overlap antara zona ritme dan jendela
-        overlap_awal = max(zona_awal, awal_sampel)
-        overlap_akhir = min(zona_akhir, akhir_sampel)
-
-        if overlap_awal < overlap_akhir:
-            durasi = overlap_akhir - overlap_awal
-            durasi_per_label[label] = durasi_per_label.get(label, 0) + durasi
-
-    # Tidak ada ritme yang tercakup di jendela ini
-    if not durasi_per_label:
-        return None
-
-    # Ambil label dengan durasi terbanyak (dominan)
-    label_dominan = max(durasi_per_label, key=durasi_per_label.get)
-
-    # Petakan ke angka kelas, atau None jika tidak dikenali
-    return LABEL_MAP.get(label_dominan, None)
-
-
-def hitung_fitur_hrv(nilai_ibi):
-    """
-    Menghitung 10 fitur HRV dari sekumpulan nilai IBI dalam satu jendela.
-
-    PENJELASAN SETIAP FITUR:
-
-    1. Mean IBI
-       = Rata-rata jarak antar-detak (ms)
-       → Menggambarkan kecepatan detak jantung rata-rata.
-         Mean IBI tinggi → jantung berdetak lambat
-         Mean IBI rendah → jantung berdetak cepat
-
-    2. Median IBI
-       = Nilai tengah jarak antar-detak (ms)
-       → Mirip Mean, tapi lebih tahan terhadap nilai ekstrem (outlier).
-
-    3. SDNN (Standard Deviation of NN intervals)
-       = Simpangan baku dari semua IBI
-       → Mengukur TOTAL variabilitas detak jantung.
-         SDNN tinggi → variabilitas tinggi (biasanya sehat)
-         SDNN rendah → variabilitas rendah (bisa tanda masalah)
-
-    4. RMSSD (Root Mean Square of Successive Differences)
-       = Akar kuadrat dari rata-rata kuadrat selisih IBI berturut-turut
-       → Mengukur variabilitas JANGKA PENDEK (detak ke detak).
-         Sangat berguna untuk mendeteksi aritmia seperti AF.
-
-    5. Coefficient of Variation (CV)
-       = SDNN / Mean IBI × 100 (%)
-       → SDNN yang dinormalisasi. Berguna untuk membandingkan
-         variabilitas antar-pasien yang detak jantungnya berbeda.
-
-    6. Mean Successive Difference (MeanSD)
-       = Rata-rata nilai absolut selisih IBI berturut-turut
-       → Mirip RMSSD tapi tanpa kuadrat, lebih intuitif.
-
-    7. Std Successive Difference (StdSD)
-       = Simpangan baku dari selisih IBI berturut-turut
-       → Mengukur seberapa "tidak teratur" perubahan detak.
-
-    8. Turning Point Ratio (TPR)
-       = Proporsi titik balik dalam deretan IBI
-       → Titik balik = IBI yang lebih besar atau lebih kecil dari
-         kedua tetangganya. Pada AF, pola detak sangat acak
-         sehingga TPR cenderung tinggi.
-
-    9. Poincaré SD1
-       = Simpangan baku tegak lurus garis identitas pada plot Poincaré
-       → Mengukur variabilitas JANGKA PENDEK.
-         Rumus: SD1 = SDSD / √2
-         (SDSD = std dari selisih IBI berturut-turut)
-
-    10. Poincaré SD2
-        = Simpangan baku sepanjang garis identitas pada plot Poincaré
-        → Mengukur variabilitas JANGKA PANJANG.
-          Rumus: SD2 = √(2×SDNN² - SD1²)
-
-    11. SD1/SD2 Ratio
-        = Rasio variabilitas jangka pendek terhadap jangka panjang
-        → Pada AF, rasio ini cenderung berbeda dari normal.
-
-    Return: dictionary berisi 10 fitur, atau None jika data tidak cukup
-    """
-    n = len(nilai_ibi)
-
-    # Minimal butuh 3 IBI untuk menghitung semua fitur
-    if n < 3:
-        return None
-
-    # ---- Fitur Dasar ----
-    mean_ibi   = np.mean(nilai_ibi)
-    median_ibi = np.median(nilai_ibi)
-    sdnn       = np.std(nilai_ibi, ddof=1)  # ddof=1 → sampel std
-
-    # ---- Selisih berturut-turut (successive differences) ----
-    selisih = np.diff(nilai_ibi)  # IBI[i+1] - IBI[i]
-
-    rmssd   = np.sqrt(np.mean(selisih ** 2))
-    mean_sd = np.mean(np.abs(selisih))
-    std_sd  = np.std(selisih, ddof=1)
-
-    # ---- Coefficient of Variation ----
-    cv = (sdnn / mean_ibi) * 100 if mean_ibi != 0 else 0
-
-    # ---- Turning Point Ratio ----
-    # Titik balik: IBI[i] > kedua tetangga ATAU IBI[i] < kedua tetangga
-    jumlah_titik_balik = 0
-    for i in range(1, n - 1):
-        if ((nilai_ibi[i] > nilai_ibi[i-1] and nilai_ibi[i] > nilai_ibi[i+1]) or
-            (nilai_ibi[i] < nilai_ibi[i-1] and nilai_ibi[i] < nilai_ibi[i+1])):
-            jumlah_titik_balik += 1
-
-    # TPR = jumlah titik balik / jumlah kemungkinan titik balik
-    tpr = jumlah_titik_balik / (n - 2) if n > 2 else 0
-
-    # ---- Poincaré ----
-    sd1 = std_sd / np.sqrt(2)
-    sd2_kuadrat = 2 * (sdnn ** 2) - (sd1 ** 2)
-    sd2 = np.sqrt(sd2_kuadrat) if sd2_kuadrat > 0 else 0
-
-    sd1_sd2 = sd1 / sd2 if sd2 != 0 else 0
-
-    return {
-        "mean_ibi":   round(mean_ibi, 4),
-        "median_ibi": round(median_ibi, 4),
-        "sdnn":       round(sdnn, 4),
-        "rmssd":      round(rmssd, 4),
-        "cv":         round(cv, 4),
-        "mean_sd":    round(mean_sd, 4),
-        "std_sd":     round(std_sd, 4),
-        "tpr":        round(tpr, 4),
-        "sd1":        round(sd1, 4),
-        "sd2":        round(sd2, 4),
-        "sd1_sd2":    round(sd1_sd2, 4),
-    }
-
-
-# ─────────────────────────────────────────────────────────────
-# PROGRAM UTAMA
-# ─────────────────────────────────────────────────────────────
-
-def main():
-    print("=" * 60)
-    print("  EKSTRAKSI FITUR HRV - DATASET AFDB")
-    print("=" * 60)
-
-    # Langkah 0: Baca daftar rekaman
-    daftar_rekaman = baca_daftar_rekaman(FOLDER)
-    print(f"\nDitemukan {len(daftar_rekaman)} rekaman di file RECORDS.")
-
-    # Siapkan wadah untuk menampung semua baris dataset
-    semua_baris = []
-
-    # Header kolom CSV
-    kolom = [
-        "record", "window_start_sec", "window_end_sec",
-        "mean_ibi", "median_ibi", "sdnn", "rmssd", "cv",
-        "mean_sd", "std_sd", "tpr", "sd1", "sd2", "sd1_sd2",
-        "label"
-    ]
-
-    rekaman_diproses = 0
-    rekaman_dilewati = 0
-    total_jendela    = 0
-    jendela_diabaikan = 0
-
-    for nama in daftar_rekaman:
-        print(f"\n── Memproses rekaman: {nama} ", end="")
-
-        # ── LANGKAH 1: Konfirmasi sampling rate ──
-        if not konfirmasi_sampling_rate(FOLDER, nama):
-            print("→ DILEWATI (sampling rate ≠ 250 Hz)")
-            rekaman_dilewati += 1
-            continue
-
-        # ── LANGKAH 2: Baca lokasi detak jantung ──
-        try:
-            lokasi_detak = baca_lokasi_detak(FOLDER, nama)
-        except Exception as e:
-            print(f"→ DILEWATI (gagal baca QRS: {e})")
-            rekaman_dilewati += 1
-            continue
-
-        # ── LANGKAH 3: Hitung IBI ──
-        waktu_ibi, nilai_ibi = hitung_ibi(lokasi_detak, FS)
-
-        if len(nilai_ibi) < 3:
-            print("→ DILEWATI (IBI terlalu sedikit)")
-            rekaman_dilewati += 1
-            continue
-
-        # ── LANGKAH 4: Baca label ritme dari .atr ──
-        try:
-            posisi_perubahan, label_ritme = baca_label_ritme(FOLDER, nama)
-        except Exception as e:
-            print(f"→ DILEWATI (gagal baca ATR: {e})")
-            rekaman_dilewati += 1
-            continue
-
-        # ── LANGKAH 5: Potong menjadi jendela 10 detik ──
-        waktu_akhir_sinyal = waktu_ibi[-1]
-        jumlah_jendela_rekaman = 0
-        jumlah_diabaikan_rekaman = 0
-
+class AFDBExtractor:
+    def __init__(self, data_folder="./files"):
+        self.data_folder = data_folder
+        self.records_file = "RECORDS"
+        self.out_tabular = "dataset_hrv_tabular.csv"
+        self.out_sequence = "dataset_hrv_sequence_23p.npz"
+        
+        self.expected_fs = 250
+        self.window_sec = 10.0
+        
+        self.class_stride = {
+            0: 5.0,   # Normal: 5s stride
+            1: 10.0,  # AFIB: 10s stride
+            2: 1.0    # AFL: 1s stride
+        }
+        
+        self.ibi_min = 300.0
+        self.ibi_max = 2000.0
+        self.max_outliers = 1
+        
+        self.max_seq_len = 30
+        
+        self.label_map = {
+            "(N": 0,
+            "(AFIB": 1,
+            "(AFL": 2
+        }
+        
+        self.blacklist = {"00735", "03665"}
+        
+        self._setup_logger()
+        
+    def _setup_logger(self):
+        self.logger = logging.getLogger("AFDBExtractor")
+        self.logger.setLevel(logging.INFO)
+        if not self.logger.handlers:
+            handler = logging.StreamHandler(sys.stdout)
+            fmt = logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
+            handler.setFormatter(fmt)
+            self.logger.addHandler(handler)
+            
+    def run_pipeline(self):
+        self.logger.info("=" * 60)
+        self.logger.info(" AFDB EXTRACTION PIPELINE (23 PASIEN BERSIH)")
+        self.logger.info("=" * 60)
+        
+        records_path = os.path.join(self.data_folder, self.records_file)
+        with open(records_path, 'r') as f:
+            all_records = [line.strip() for line in f if line.strip()]
+            
+        valid_records = [r for r in all_records if r not in self.blacklist]
+        self.logger.info(f"Ditemukan {len(all_records)} rekaman. Setelah filter blacklist, sisa {len(valid_records)} rekaman.")
+        
+        all_windows = []
+        
+        for rec in valid_records:
+            self.logger.info(f"── Memproses rekaman: {rec}")
+            
+            try:
+                header = wfdb.rdheader(os.path.join(self.data_folder, rec))
+                fs = header.fs
+            except Exception as e:
+                self.logger.warning(f"   [SKIP] Gagal baca header: {e}")
+                continue
+                
+            path = os.path.join(self.data_folder, rec)
+            r_peaks = None
+            if rec == "07859":
+                if os.path.exists(path + ".qrsc"):
+                    r_peaks = wfdb.rdann(path, "qrsc").sample
+                else:
+                    self.logger.warning("   [SKIP] Rekaman 07859 wajib menggunakan .qrsc, tapi file tidak ditemukan.")
+                    continue
+            else:
+                if os.path.exists(path + ".qrsc"):
+                    r_peaks = wfdb.rdann(path, "qrsc").sample
+                elif os.path.exists(path + ".qrs"):
+                    r_peaks = wfdb.rdann(path, "qrs").sample
+                else:
+                    self.logger.warning("   [SKIP] Tidak ada file qrs/qrsc.")
+                    continue
+            
+            try:
+                atr = wfdb.rdann(path, "atr")
+                pos_perubahan = atr.sample
+                label_ritme = atr.aux_note
+            except Exception as e:
+                self.logger.warning(f"   [SKIP] Gagal baca anotasi ritme: {e}")
+                continue
+                
+            if len(r_peaks) < 4:
+                continue
+                
+            waktu_ibi, nilai_ibi, delta_ibi = self.hitung_ibi_delta(r_peaks, fs)
+            
+            windows = self.proses_windowing(rec, waktu_ibi, nilai_ibi, delta_ibi, r_peaks, pos_perubahan, label_ritme, fs)
+            all_windows.extend(windows)
+            
+            # log stats per rekaman
+            counts = {0:0, 1:0, 2:0}
+            for w in windows:
+                counts[w['label']] += 1
+            self.logger.info(f"   → {len(windows)} windows valid (0: {counts[0]}, 1: {counts[1]}, 2: {counts[2]})")
+            
+        if not all_windows:
+            self.logger.error("Tidak ada window yang dihasilkan!")
+            return
+            
+        self.export_tabular(all_windows)
+        self.export_sequence(all_windows)
+        
+        self.logger.info("=" * 60)
+        self.logger.info(" RINGKASAN AKHIR")
+        self.logger.info("=" * 60)
+        self.logger.info(f"Total windows valid: {len(all_windows)}")
+        y = np.array([w['label'] for w in all_windows])
+        for c in [0, 1, 2]:
+            self.logger.info(f"  Kelas {c}: {np.sum(y == c)}")
+        self.logger.info("Selesai! ✓")
+
+    def hitung_ibi_delta(self, r_peaks, fs):
+        selisih = np.diff(r_peaks)
+        ibi = selisih / fs * 1000.0
+        waktu_ibi = r_peaks[1:] / fs
+        delta_ibi = np.diff(ibi)
+        return waktu_ibi.astype(np.float64), ibi, delta_ibi
+
+    def tentukan_label(self, rp, pos, labels):
+        idx = np.searchsorted(pos, rp, side='right') - 1
+        if idx < 0: return None
+        return self.label_map.get(labels[idx], None)
+
+    def proses_windowing(self, rec, waktu_ibi, nilai_ibi, delta_ibi, r_peaks, pos_perubahan, label_ritme, fs):
+        if len(waktu_ibi) < 3: return []
+        
+        waktu_akhir = waktu_ibi[-1]
+        windows = []
+        
+        step = min(self.class_stride.values())
         awal = 0.0
-        while awal + WINDOW_SEC <= waktu_akhir_sinyal:
-            akhir = awal + WINDOW_SEC
-
-            # Ambil IBI yang jatuh di jendela ini
+        
+        while awal + self.window_sec <= waktu_akhir:
+            akhir = awal + self.window_sec
+            
             mask = (waktu_ibi >= awal) & (waktu_ibi < akhir)
-            ibi_jendela = nilai_ibi[mask]
-
-            # ── LANGKAH 6: Hitung fitur HRV ──
-            fitur = hitung_fitur_hrv(ibi_jendela)
-
-            if fitur is None:
-                awal = akhir
-                jumlah_diabaikan_rekaman += 1
+            idx_ibi = np.where(mask)[0]
+            
+            if len(idx_ibi) < 3:
+                awal += step
                 continue
-
-            # ── LANGKAH 7: Tentukan label kelas ──
-            label = tentukan_label_jendela(
-                awal, akhir, posisi_perubahan, label_ritme, FS
-            )
-
-            # Abaikan jendela jika label bukan N, AFIB, atau AFL
-            if label is None:
-                awal = akhir
-                jumlah_diabaikan_rekaman += 1
+                
+            ibi_window = nilai_ibi[idx_ibi]
+            
+            delta_idx = [j for j in idx_ibi if (j+1) in idx_ibi and j < len(delta_ibi)]
+            if not delta_idx:
+                awal += step
                 continue
+            delta_window = delta_ibi[np.array(delta_idx)]
+            
+            outliers = (ibi_window < self.ibi_min) | (ibi_window > self.ibi_max)
+            if np.sum(outliers) > self.max_outliers:
+                awal += step
+                continue
+                
+            rp_samples = r_peaks[idx_ibi + 1]
+            labels_detak = [self.tentukan_label(rp, pos_perubahan, label_ritme) for rp in rp_samples]
+            
+            unique_lbl = set(labels_detak)
+            if None in unique_lbl or len(unique_lbl) != 1:
+                awal += step
+                continue
+                
+            label_kelas = unique_lbl.pop()
+            
+            windows.append({
+                "record": rec,
+                "window_start": awal,
+                "window_end": akhir,
+                "ibi": ibi_window.copy(),
+                "delta_ibi": delta_window.copy(),
+                "label": label_kelas
+            })
+            
+            awal += self.class_stride.get(label_kelas, step)
+            
+        return windows
 
-            # Simpan baris data
-            baris = [nama, awal, akhir]
-            baris += list(fitur.values())
-            baris.append(label)
-            semua_baris.append(baris)
+    def export_tabular(self, windows):
+        rows = []
+        for w in windows:
+            ibi = w['ibi']
+            delta = w['delta_ibi']
+            rows.append({
+                "record": w['record'],
+                "window_start": round(w['window_start'], 4),
+                "window_end": round(w['window_end'], 4),
+                "mean_ibi": round(float(np.mean(ibi)), 4),
+                "min_ibi": round(float(np.min(ibi)), 4),
+                "max_ibi": round(float(np.max(ibi)), 4),
+                "range_ibi": round(float(np.max(ibi) - np.min(ibi)), 4),
+                "var_delta_ibi": round(float(np.var(delta, ddof=1)), 4) if len(delta) > 1 else 0.0,
+                "beat_count": len(ibi),
+                "label": w['label']
+            })
+        
+        df = pd.DataFrame(rows)
+        out_path = os.path.join(self.data_folder, "..", self.out_tabular)
+        df.to_csv(out_path, index=False)
+        self.logger.info(f"BRANCH A: Tersimpan di {out_path} ({len(df)} baris)")
 
-            jumlah_jendela_rekaman += 1
-            awal = akhir
-
-        rekaman_diproses += 1
-        total_jendela += jumlah_jendela_rekaman
-        jendela_diabaikan += jumlah_diabaikan_rekaman
-        print(f"→ {jumlah_jendela_rekaman} jendela "
-              f"({jumlah_diabaikan_rekaman} diabaikan)")
-
-    # ── Simpan ke CSV ──
-    output_path = os.path.join(FOLDER, "..", OUTPUT_FILE)
-    with open(output_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(kolom)
-        writer.writerows(semua_baris)
-
-    # ── Ringkasan ──
-    print("\n" + "=" * 60)
-    print("  RINGKASAN")
-    print("=" * 60)
-    print(f"  Rekaman diproses    : {rekaman_diproses}")
-    print(f"  Rekaman dilewati    : {rekaman_dilewati}")
-    print(f"  Total jendela valid : {total_jendela}")
-    print(f"  Jendela diabaikan   : {jendela_diabaikan}")
-    print(f"  File output         : {os.path.abspath(output_path)}")
-
-    # Hitung distribusi kelas
-    if semua_baris:
-        labels = [b[-1] for b in semua_baris]
-        nama_kelas = {0: "Normal (N)", 1: "AFIB", 2: "AFL"}
-        print(f"\n  Distribusi Kelas:")
-        for kode, nama_k in nama_kelas.items():
-            jumlah = labels.count(kode)
-            print(f"    Kelas {kode} ({nama_k:10s}) : {jumlah:>6} jendela")
-
-    print("\nSelesai! ✓")
+    def export_sequence(self, windows):
+        n = len(windows)
+        X = np.zeros((n, self.max_seq_len, 2), dtype=np.float32)
+        mask = np.zeros((n, self.max_seq_len), dtype=np.float32)
+        y = np.zeros(n, dtype=np.int64)
+        records = []
+        
+        for i, w in enumerate(windows):
+            ibi = w['ibi']
+            delta = w['delta_ibi']
+            seq_len = min(len(ibi), self.max_seq_len)
+            
+            X[i, 0, 0] = ibi[0]
+            X[i, 0, 1] = 0.0
+            
+            for j in range(1, seq_len):
+                X[i, j, 0] = ibi[j]
+                X[i, j, 1] = delta[j-1] if j-1 < len(delta) else 0.0
+                
+            mask[i, :seq_len] = 1.0
+            y[i] = w['label']
+            records.append(w['record'])
+            
+        out_path = os.path.join(self.data_folder, "..", self.out_sequence)
+        np.savez_compressed(
+            out_path,
+            X=X,
+            mask=mask,
+            y=y,
+            records=np.array(records)
+        )
+        self.logger.info(f"BRANCH B: Tersimpan di {out_path}")
 
 
 if __name__ == "__main__":
-    main()
+    extractor = AFDBExtractor()
+    extractor.run_pipeline()

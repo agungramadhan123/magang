@@ -1,1 +1,0 @@
-link_drive = "https://drive.google.com/file/d/1BijiKvXOajSyds7RM7r9lTJUMH8sJA14/view?usp=sharing"

@@ -67,3 +67,7 @@ files/
 *.csv
 *.json
 penjelasan.md
+
+raw_71.json
+dataset_hrv_tabular.csv
+dataset_hrv_sequence_23p.npz
